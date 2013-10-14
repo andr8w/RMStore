@@ -19,6 +19,7 @@
 //
 
 #import "RMStore.h"
+#import "STKeychain.h"
 
 NSString *const RMStoreErrorDomain = @"net.robotmedia.store";
 NSInteger const RMStoreErrorCodeUnknownProductIdentifier = 100;
@@ -40,6 +41,8 @@ NSString* const RMStoreNotificationStoreReceipt = @"storeReceipt";
 NSString* const RMStoreNotificationTransaction = @"transaction";
 
 NSString* const RMStoreUserDefaultsKey = @"purchases";
+NSString* const RMStoreKeychainKeySuffix = @"RMStoreKeychainKey"; // appended to bundle identifier to use as keychain username
+NSString* const RMStoreKeychainServiceNameSuffix = @"RMStoreKeychainServiceName"; // appended to bundle identifier to use as keychain service name
 
 NSString* const RMStoreCoderConsumedKey = @"consumed";
 NSString* const RMStoreCoderProductIdentifierKey = @"productIdentifier";
@@ -192,6 +195,8 @@ typedef void (^RMStoreSuccessBlock)();
     NSInteger _pendingRestoredTransactionsCount;
     BOOL _restoredCompletedTransactionsFinished;
     
+    BOOL _useKeychain;
+    
     SKReceiptRefreshRequest *_refreshReceiptRequest;
     void (^_refreshReceiptFailureBlock)(NSError* error);
     void (^_refreshReceiptSuccessBlock)();
@@ -209,6 +214,7 @@ typedef void (^RMStoreSuccessBlock)();
         _productsRequestDelegates = [NSMutableSet set];
         _defaultTransactionObfuscator = [[RMStoreDefaultTransactionObfuscator alloc] init];
         _transactionObfuscator = _defaultTransactionObfuscator;
+        _useKeychain = [self purchasesDictionaryFromKeychain] ? YES : NO; // check if there's data in Keychain
         [[SKPaymentQueue defaultQueue] addTransactionObserver:self];
     }
     return self;
@@ -366,12 +372,87 @@ typedef void (^RMStoreSuccessBlock)();
 	return formattedString;
 }
 
+#pragma mark Keychain
+
+- (void)setUseKeychain:(BOOL)useKeychain
+{
+    if (_useKeychain != useKeychain)
+    {
+        // transfer purchases between NSUserDefaults and Keychain, or vice-versa
+        NSDictionary *existingPurchases = [[RMStore defaultStore] purchases];
+        if (existingPurchases)
+        {
+            // delete purchases from existing location
+            [[RMStore defaultStore] clearPurchases];
+            _useKeychain = useKeychain;
+            // record purchases in new location
+            [[RMStore defaultStore] recordPurchases:existingPurchases];
+        }
+    }
+}
+
+- (NSString *)bundleIdentifier
+{
+    return [[[NSBundle mainBundle] infoDictionary] objectForKey:(NSString*)kCFBundleIdentifierKey];
+}
+
+- (NSString *)keychainKey
+{
+    return [[[self bundleIdentifier] stringByAppendingString:@":"] stringByAppendingString:RMStoreKeychainKeySuffix];
+}
+
+- (NSString *)keychainServiceName
+{
+    return [[[self bundleIdentifier] stringByAppendingString:@":"] stringByAppendingString:RMStoreKeychainServiceNameSuffix];
+}
+
+- (NSString *)purchasesDictionaryFromKeychainAsXMLString
+{
+    NSError *error;
+    NSString *xml = [STKeychain getPasswordForUsername:[self keychainKey] andServiceName:[self keychainServiceName] error:&error];
+    if (error)
+    {
+        NSLog(@"Keychain error: %@", error);
+        return nil;
+    }
+    
+    return xml;
+}
+
+- (NSDictionary *)purchasesDictionaryFromKeychain
+{
+    NSDictionary *purchases;
+    
+    NSString *xml = [self purchasesDictionaryFromKeychainAsXMLString];
+    if (xml) {
+        NSError *error;
+        NSData *dictionaryAsData = [xml dataUsingEncoding:NSUTF8StringEncoding];
+        purchases = [NSPropertyListSerialization propertyListWithData:dictionaryAsData options:NSPropertyListImmutable format:nil error:&error];
+        if (error)
+        {
+            NSLog(@"NSPropertyListSerialization error: %@", error);
+            return nil;
+        }
+    }
+    
+    return purchases;
+}
+
 #pragma mark Purchase management
 
 - (NSDictionary *)purchases
 {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSDictionary *purchases = [defaults objectForKey:RMStoreUserDefaultsKey] ? : [NSDictionary dictionary];
+    NSDictionary *purchases;
+    
+    if (_useKeychain)
+    {
+        purchases = [self purchasesDictionaryFromKeychain];
+    }
+    else
+    {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        purchases = [defaults objectForKey:RMStoreUserDefaultsKey] ? : [NSDictionary dictionary];
+    }
 
     return purchases;
 }
@@ -383,9 +464,21 @@ typedef void (^RMStoreSuccessBlock)();
 
 - (void)clearPurchases
 {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults removeObjectForKey:RMStoreUserDefaultsKey];
-    [defaults synchronize];
+    if (_useKeychain)
+    {
+        NSError *error;
+        BOOL success = [STKeychain deleteItemForUsername:[self keychainKey] andServiceName:[self keychainServiceName] error:&error];
+        if (!success) NSLog(@"Deleting from keychain failed");
+        if (error) {
+            NSLog(@"Keychain error: %@", error);
+        }
+    }
+    else
+    {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults removeObjectForKey:RMStoreUserDefaultsKey];
+        [defaults synchronize];
+    }
 }
 
 - (BOOL)consumeProductForIdentifier:(NSString*)productIdentifier
@@ -463,13 +556,36 @@ typedef void (^RMStoreSuccessBlock)();
     [self setTransactions:updatedTransactions forProductIdentifier:productIdentifier];
 }
 
+- (void)recordPurchases:(NSDictionary *)purchases
+{
+	if (_useKeychain)
+    {
+        NSError *propertyListError;
+        NSData *data = [NSPropertyListSerialization dataWithPropertyList:purchases format:NSPropertyListXMLFormat_v1_0 options:NSPropertyListImmutable error:&propertyListError];
+        if (propertyListError)
+        {
+            NSLog(@"NSPropertyListSerialization error: %@", propertyListError);
+            return;
+        }
+        NSError *keychainError;
+        NSString *xml = [[NSString alloc] initWithBytes:[data bytes] length:[data length] encoding:NSUTF8StringEncoding];
+        BOOL success = [STKeychain storeUsername:[self keychainKey] andPassword:xml forServiceName:[self keychainServiceName] updateExisting:YES error:&keychainError];
+        if (!success) NSLog(@"Saving to keychain failed");
+        if (keychainError) NSLog(@"Keychain error: %@", keychainError);
+    }
+    else
+    {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults setObject:purchases forKey:RMStoreUserDefaultsKey];
+        [defaults synchronize];
+    }
+}
+
 - (void)setTransactions:(NSArray*)transactions forProductIdentifier:(NSString*)productIdentifier
 {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary *updatedPurchases = [NSMutableDictionary dictionaryWithDictionary:[self purchases]];
     [updatedPurchases setObject:transactions forKey:productIdentifier];
-    [defaults setObject:updatedPurchases forKey:RMStoreUserDefaultsKey];
-    [defaults synchronize];
+    [self recordPurchases:updatedPurchases];
 }
 
 #pragma mark Observers

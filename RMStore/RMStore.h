@@ -40,6 +40,11 @@ extern NSInteger const RMStoreErrorCodeUnknownProductIdentifier;
  */
 + (RMStore*)defaultStore;
 
+/** Configure RMStore to use Keychain instead of NSUserDefaults to store purchase info.
+ @param useKeychain Pass YES to use Keychain, NO to use NSUserDefaults. Defaults to NO if purchase info is not found in Keychain during initialization.
+ */
+- (void)setUseKeychain:(BOOL)useKeychain;
+
 #pragma mark StoreKit Wrapper
 ///---------------------------------------------
 /// @name Calling StoreKit
