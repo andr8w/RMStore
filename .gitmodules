@@ -1,0 +1,3 @@
+[submodule "Externals/STUtils"]
+	path = Externals/STUtils
+	url = https://github.com/andr8w/STUtils.git
